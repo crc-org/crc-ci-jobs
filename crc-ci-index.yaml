@@ -1,0 +1,170 @@
+- defaults:
+    name: 'global'
+    timeout: '15m'
+    jobdescription: 'Managed by Jenkins Job Builder, do not edit manually! Update via https://github.com/code-ready/crc-ci-jobs'
+    git_organization: code-ready
+    github_user: crc-bot
+    wrappers:
+        - ansicolor
+        - workspace-cleanup
+        - timestamps
+
+- trigger:
+    name: githubprb
+    triggers:
+        - github-pull-request:
+              admin-list:
+                  - crc-bot
+                  - praveenkumar
+                  - gbraad
+                  - anjannath
+                  - robin-owen
+                  - tsedmik
+                  - jsliacan
+                  - teuf
+                  - zeenix
+              cron: '* * * * *'
+              github-hooks: true
+              permit-all: false
+              trigger-phrase: '.*\[test\].*'
+              allow-whitelist-orgs-as-admins: true
+              status-context: 'ci.centos.org PR build'
+              cancel-builds-on-update: true
+- scm:
+    name: git-scm
+    scm:
+      - git:
+          url: '{git_url}'
+          skip-tag: 'True'
+          git-tool: ci-git
+          refspec: '+refs/pull/*:refs/remotes/origin/pr/*'
+          branches:
+              - '${{ghprbActualCommit}}'
+
+- job-template:
+    name: '{git_repo}'
+    description: |
+      {jobdescription}
+    node: "{ci_project}"
+    properties:
+        - github:
+            url: https://github.com/{git_organization}/{git_repo}/
+    scm:
+        - git:
+            url: https://github.com/{git_organization}/{git_repo}.git
+            shallow_clone: true
+            branches:
+                - master
+    triggers:
+        - github
+    publishers:
+        - email-ext:
+            recipients: anjan@redhat.com,prkumar@redhat.com,gbraad@redhat.com,jsliacan@redhat.com,tsedmik@redhat.com
+            content-type: text
+            subject: Minishift master build $BUILD_NUMBER failed
+            body: "The build has failed. Check the build URL for failure logs: $BUILD_URL"
+            failure: true
+    builders:
+        - shell: |
+            # testing out the cico client
+            set +e
+            export CICO_API_KEY=$(cat ~/duffy.key)
+            read CICO_hostname CICO_ssid <<< $(cico node get -f value -c ip_address -c comment --retry-count 12)
+
+            if [[ $CICO_hostname != "" ]]; then
+              sshopts="-t -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -l root"
+              ssh_cmd="ssh $sshopts $CICO_hostname"
+              env > jenkins-env
+              $ssh_cmd yum -y install rsync
+              rsync -e "ssh $sshopts" -Ha $(pwd)/ $CICO_hostname:payload
+              $ssh_cmd -t "cd payload && {ci_cmd}"
+              rtn_code=$?
+              cico node done $CICO_ssid
+              if [[ $rtn_code -eq 124 ]]; then
+                echo "BUILD TIMEOUT";
+              fi
+              exit $rtn_code
+            else
+              echo "CICO: Unable to get Node.";
+              exit 1
+            fi
+
+- job-template:
+    name: '{git_repo}-pr'
+    description: |
+        {jobdescription}
+    node: '{ci_project}'
+    concurrent: true
+    properties:
+        - github:
+            url: https://github.com/{git_organization}/{git_repo}/
+    scm:
+        - git-scm:
+            git_url: https://{github_user}@github.com/{git_organization}/{git_repo}.git
+    triggers:
+        - githubprb
+    builders:
+        - shell: |
+              # testing out the cico client
+              set +e
+              export CICO_API_KEY=$(cat ~/duffy.key)
+              read CICO_hostname CICO_ssid <<< $(cico node get -f value -c ip_address -c comment --retry-count 12)
+
+              if [[ $CICO_hostname != "" ]]; then
+                sshopts="-t -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -l root"
+                ssh_cmd="ssh $sshopts $CICO_hostname"
+                env > jenkins-env
+                $ssh_cmd yum -y install rsync
+                git rebase origin/${{ghprbTargetBranch}} \
+                && rsync -e "ssh $sshopts" -Ha $(pwd)/ $CICO_hostname:payload \
+                && /usr/bin/timeout {timeout} $ssh_cmd -t "cd payload && {ci_cmd}"
+                rtn_code=$?
+                if [ $rtn_code -eq 0 ]; then
+                  cico node done $CICO_ssid
+                else
+                  # fail mode gives us 12 hrs to debug the machine
+                  curl "http://admin.ci.centos.org:8080/Node/fail?key=$CICO_API_KEY&ssid=$CICO_ssid"
+                fi
+                exit $rtn_code
+              else
+                echo "CICO: Unable to get Node.";
+                exit 1
+              fi
+
+
+- job-template:
+    name: '{git_repo}-test-job'
+    description: |
+        'Minishift test job! Managed by Jenkins Job Builder, do not edit manually! Update via https://github.com/code-ready/crc-ci-jobs.'
+    node: '{ci_project}'
+    concurrent: true
+    builders:
+      - shell: |
+              echo "Job Triggered successfully."
+
+- project:
+    name: code-ready
+    jobs:
+      # Master builds
+      - '{git_repo}':
+          git_repo: crc
+          ci_project: '{name}'
+          ci_cmd: '/bin/bash centos_ci.sh'
+          timeout: '180m'
+      # PR builds
+      - '{git_repo}-pr':
+          git_repo: crc
+          ci_project: '{name}'
+          ci_cmd: '/bin/bash centos_ci.sh'
+          timeout: '180m'
+      # Test build
+      - '{git_repo}-test-job':
+          git_repo: crc
+          ci_project: '{name}'
+          timeout: '20m'
+      # PR test for crc-ci-index.yaml
+      - '{git_repo}-pr':
+          git_repo: crc-ci-jobs
+          ci_project: '{name}'
+          ci_cmd: '/bin/bash cico_pr_test.sh'
+          timeout: '10m'
